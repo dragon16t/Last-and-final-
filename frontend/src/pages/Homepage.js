@@ -650,6 +650,10 @@ function Homepage() {
   );
 }
 
+// Brand imagery served permanently from Cloudinary — these used to point at
+// /api/uploads/assets/* on the pod's disposable disk, which 404s after a redeploy.
+const CG_BRAND = 'https://res.cloudinary.com/dcvuqcqjn/image/upload';
+
 const TRACKER_SKIN = {
   pores: 'https://images.unsplash.com/photo-1541752857837-f8a0154fd092?crop=entropy&cs=srgb&fm=jpg&q=85&w=400',
   pores2: 'https://images.unsplash.com/photo-1710580889701-9fa8f2cd5927?crop=entropy&cs=srgb&fm=jpg&q=85&w=400',
@@ -659,14 +663,14 @@ const TRACKER_SKIN = {
   healthy: 'https://images.unsplash.com/photo-1728727267814-792db55ce678?crop=entropy&cs=srgb&fm=jpg&q=85&w=500',
   beforeModel: 'https://images.pexels.com/photos/5588000/pexels-photo-5588000.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=600&w=500',
   afterModel: 'https://images.unsplash.com/photo-1728727267814-792db55ce678?crop=entropy&cs=srgb&fm=jpg&q=85&w=500',
-  aiBeforeAfter: `${process.env.REACT_APP_BACKEND_URL}/api/uploads/assets/user-before-after.png`,
+  aiBeforeAfter: `${CG_BRAND}/f_webp,q_auto:good,w_1000/celesta-glow/brand/skin-analysis-before-after`,
 };
 
 const TRACKER_PRODUCTS = [
-  { label: 'Cleanser', when: 'AM / PM', img: `${process.env.REACT_APP_BACKEND_URL}/api/uploads/assets/rec-cleanser.jpg` },
-  { label: 'Serum', when: 'AM / PM', img: `${process.env.REACT_APP_BACKEND_URL}/api/uploads/assets/rec-serum.jpg` },
-  { label: 'Moisturizer', when: 'AM / PM', img: `${process.env.REACT_APP_BACKEND_URL}/api/uploads/assets/rec-moisturizer.jpg` },
-  { label: 'Sunscreen', when: 'AM', img: `${process.env.REACT_APP_BACKEND_URL}/api/uploads/assets/rec-sunscreen.jpg` },
+  { label: 'Cleanser', when: 'AM / PM', img: `${CG_BRAND}/f_webp,q_auto:good,w_400/celesta-glow/brand/rec-cleanser` },
+  { label: 'Serum', when: 'AM / PM', img: `${CG_BRAND}/f_webp,q_auto:good,w_400/celesta-glow/brand/rec-serum` },
+  { label: 'Moisturizer', when: 'AM / PM', img: `${CG_BRAND}/f_webp,q_auto:good,w_400/celesta-glow/brand/rec-moisturizer` },
+  { label: 'Sunscreen', when: 'AM', img: `${CG_BRAND}/f_webp,q_auto:good,w_400/celesta-glow/brand/rec-sunscreen` },
 ];
 
 function MetricRow({ icon: Icon, label, value, up }) {
@@ -815,9 +819,17 @@ function TrackerPromo() {
                 <span className="text-[13px] font-black text-stone-900 whitespace-nowrap">Skin Analysis</span>
                 <span className="text-[10px] text-stone-400 font-semibold whitespace-nowrap shrink-0">12 Sep 2026</span>
               </div>
-              {/* before / after — AI-generated split image with a clean centre divider */}
-              <div className="relative rounded-2xl overflow-hidden aspect-[4/3] bg-stone-100">
-                <img src={TRACKER_SKIN.aiBeforeAfter} alt="Skin before and after" loading="lazy" className="absolute inset-0 w-full h-full object-cover" />
+              {/* before / after — owner-supplied comparison photo. Square so the
+                  full frame shows (the old 4:3 crop cut the faces), and the image
+                  carries no baked-in captions, so the Day labels are added once here. */}
+              <div className="relative rounded-2xl overflow-hidden aspect-square bg-stone-100">
+                <img
+                  src={TRACKER_SKIN.aiBeforeAfter}
+                  alt="Skin before and after 30 days — acne, texture and tone improvement"
+                  width="1000" height="1000"
+                  loading="lazy" decoding="async"
+                  className="absolute inset-0 w-full h-full object-cover"
+                />
                 <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-0.5 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.08)]" />
                 <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-9 h-9 rounded-full bg-white shadow-lg ring-1 ring-black/5 flex items-center justify-center">
                   <ChevronLeft size={12} className="text-stone-500" /><ChevronRight size={12} className="text-stone-500 -ml-1.5" />
