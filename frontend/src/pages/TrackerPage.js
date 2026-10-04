@@ -1,12 +1,10 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
-import JourneyStart from '../components/JourneyStart';
-import { JourneyView } from './JourneyPage';
 import {
   Sparkles, Camera, Loader2, Mail, KeyRound, ArrowLeft, TrendingUp, Package,
   LogOut, Upload, Check, Leaf, Ban, Sun, Moon, ChevronRight, Star, CalendarDays,
-  User, ClipboardList, ShoppingBag, Gift,
+  User, ClipboardList, ShoppingBag, Gift, ArrowRight,
 } from 'lucide-react';
 
 const API = process.env.REACT_APP_BACKEND_URL;
@@ -132,6 +130,31 @@ const SCORE_LABELS = {
   even_tone: 'Even Tone', fine_lines: 'Fine Lines', hydration: 'Hydration',
 };
 
+/* ------------------------------------------------- SKIN ANALYSIS VISUAL */
+// Owner-supplied before/after close-up, stored permanently on Cloudinary and
+// delivered as WebP (f_webp) at a capped width so it loads fast on mobile.
+const SKIN_ANALYSIS_IMG =
+  'https://res.cloudinary.com/dcvuqcqjn/image/upload/f_webp,q_auto:good,w_900/celesta-glow/brand/skin-analysis-before-after';
+
+function SkinAnalysisVisual() {
+  return (
+    <figure className="mt-4" data-testid="skin-analysis-visual">
+      <img
+        src={SKIN_ANALYSIS_IMG}
+        alt="Before and after skin analysis close-up showing acne and texture improvement"
+        width="900"
+        height="900"
+        loading="lazy"
+        decoding="async"
+        className="w-full rounded-2xl border border-stone-100 bg-stone-50"
+      />
+      <figcaption className="text-[11px] text-stone-400 mt-2 text-center">
+        Real comparison — acne, texture &amp; tone improvement our AI tracks for you
+      </figcaption>
+    </figure>
+  );
+}
+
 /* ----------------------------------------------------------------- REPORT VIEW */
 function ReportView({ report, onStartRoutine }) {
   if (!report) return null;
@@ -198,6 +221,8 @@ function ReportView({ report, onStartRoutine }) {
             </div>
           ))}
         </div>
+        {/* Owner-requested before/after visual, directly below Skin Analysis */}
+        <SkinAnalysisVisual />
       </div>
       {/* routine */}
       <div className="grid sm:grid-cols-2 gap-4">
@@ -233,13 +258,41 @@ function ReportView({ report, onStartRoutine }) {
 }
 
 /* ----------------------------------------------------------------- SCAN PANEL */
-function ScanPanel({ token, onScanned, latest }) {
+const PLAN_GOALS = [
+  'Clear Acne', 'Fade Dark Spots', 'Brighten & Glow', 'Reduce Fine Lines',
+  'Even Skin Tone', 'Hydrate & Repair', 'Control Oil', 'Shrink Pores',
+];
+const PLAN_GENDERS = [
+  { value: 'female', label: 'Female' },
+  { value: 'male', label: 'Male' },
+  { value: 'other', label: 'Other' },
+];
+const PLAN_AGES = ['18–24', '25–34', '35–44', '45+'];
+const PLAN_SKIN_TYPES = ['normal', 'dry', 'oily', 'combination', 'sensitive'];
+
+/**
+ * ScanPanel — the scanning page. This is the ONLY place the 30-day plan
+ * details are collected: photo, goals, gender, age and skin type, all behind
+ * the OTP login. Submitting runs the AI scan, starts + saves the plan, then
+ * hands control to the Progress page where the routine runs.
+ */
+function ScanPanel({ token, onScanned, latest, onPlanStarted }) {
   const [preview, setPreview] = useState(null);
   const [dataUrl, setDataUrl] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [report, setReport] = useState(latest || null);
+  const [goals, setGoals] = useState([]);
+  const [gender, setGender] = useState('female');
+  const [age, setAge] = useState('25–34');
+  const [skinType, setSkinType] = useState('combination');
   const fileRef = useRef(null);
+
+  const toggleGoal = (g) => setGoals((prev) => {
+    if (prev.includes(g)) return prev.filter((x) => x !== g);
+    if (prev.length >= 2) return [prev[1], g];
+    return [...prev, g];
+  });
 
   const pick = async (e) => {
     const f = e.target.files?.[0];
@@ -251,25 +304,56 @@ function ScanPanel({ token, onScanned, latest }) {
   };
 
   const scan = async () => {
-    if (!dataUrl) { setError('A photo is required to scan your skin.'); return; }
+    if (!dataUrl) { setError('A photo is required to build your routine.'); return; }
+    if (!goals.length) { setError('Pick at least one goal for your 30-day plan.'); return; }
     setLoading(true); setError('');
     try {
-      const r = await axios.post(`${API}/api/tracker/scan`, { photo_base64: dataUrl }, authHeader(token));
+      const r = await axios.post(`${API}/api/tracker/scan`, {
+        photo_base64: dataUrl,
+        goals, gender, age, skin_type: skinType,
+        start_plan: true,
+      }, authHeader(token));
       setReport(r.data.report);
       onScanned?.(r.data.report);
+      // Routine has started and is saved — move to the progress page.
+      onPlanStarted?.(r.data.plan || null);
     } catch (e2) {
       setError(e2.response?.data?.detail || 'Scan failed. Please try a clearer selfie.');
     } finally { setLoading(false); }
   };
 
+  const Chips = ({ label, options, value, onPick, testid, multi = false }) => (
+    <div className="mt-4">
+      <p className="text-[10px] font-black tracking-[0.22em] uppercase text-stone-400 mb-2">{label}</p>
+      <div className="flex flex-wrap gap-2">
+        {options.map((o) => {
+          const val = typeof o === 'string' ? o : o.value;
+          const lbl = typeof o === 'string' ? o : o.label;
+          const active = multi ? value.includes(val) : value === val;
+          return (
+            <button key={val} type="button" onClick={() => onPick(val)}
+              data-testid={`${testid}-${String(val).toLowerCase().replace(/\s+/g, '-')}`}
+              className={`px-3.5 py-1.5 rounded-full text-xs font-bold capitalize transition-all flex items-center gap-1.5 ${
+                active ? 'bg-emerald-600 text-white shadow' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+              {active && <Check size={11} />}{lbl}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-5">
-      <div className="bg-white rounded-2xl border border-stone-100 p-5">
+      <div className="bg-white rounded-2xl border border-stone-100 p-5" data-testid="scan-onboarding">
+        <div className="inline-flex items-center gap-1.5 bg-emerald-50 text-emerald-700 rounded-full px-3 py-1 mb-3">
+          <Sparkles size={13} /> <span className="text-[11px] font-black uppercase tracking-wide">30-Day Complete Routine Plan</span>
+        </div>
         <div className="flex items-start gap-2 mb-1">
           <Camera size={18} className="text-emerald-600 mt-0.5" />
           <div>
-            <p className="text-sm font-black text-stone-900">Scan your skin</p>
-            <p className="text-[12px] text-stone-500">A clear front selfie is <b className="text-stone-700">required</b> — our AI reads your skin to build your routine.</p>
+            <p className="text-sm font-black text-stone-900">Scan your skin &amp; set your plan</p>
+            <p className="text-[12px] text-stone-500">A clear front selfie is <b className="text-stone-700">required</b> — our AI reads your skin, then builds and saves your 30-day routine.</p>
           </div>
         </div>
 
@@ -284,14 +368,22 @@ function ScanPanel({ token, onScanned, latest }) {
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 border border-emerald-200 bg-emerald-50 text-emerald-700 font-bold text-sm px-5 py-3 rounded-xl hover:bg-emerald-100 transition-colors">
               <Camera size={16} /> {preview ? 'Change photo' : 'Upload / take photo'}
             </button>
-            <button onClick={scan} disabled={!dataUrl || loading} data-testid="scan-run"
-              className="w-full sm:w-auto sm:ml-3 mt-3 sm:mt-0 inline-flex items-center justify-center gap-2 bg-emerald-700 hover:bg-emerald-800 text-white font-black text-sm px-6 py-3 rounded-xl transition-colors disabled:opacity-50">
-              {loading ? <><Loader2 size={16} className="animate-spin" /> Analysing…</> : <><Sparkles size={16} /> Analyse my skin</>}
-            </button>
-            {!dataUrl && <p className="text-[11px] text-stone-400 mt-2">Photo is mandatory to generate your analysis.</p>}
+            {!dataUrl && <p className="text-[11px] text-stone-400 mt-2">Photo is mandatory to generate your routine.</p>}
           </div>
         </div>
-        {error && <p className="text-xs text-rose-600 bg-rose-50 rounded-lg px-3 py-2 mt-3">{error}</p>}
+
+        {/* Plan details — collected here, after login */}
+        <Chips label="Your goal (pick 1–2)" options={PLAN_GOALS} value={goals} onPick={toggleGoal} testid="plan-goal" multi />
+        <Chips label="Gender" options={PLAN_GENDERS} value={gender} onPick={setGender} testid="plan-gender" />
+        <Chips label="Age" options={PLAN_AGES} value={age} onPick={setAge} testid="plan-age" />
+        <Chips label="Skin type" options={PLAN_SKIN_TYPES} value={skinType} onPick={setSkinType} testid="plan-skin-type" />
+
+        <button onClick={scan} disabled={!dataUrl || loading} data-testid="scan-run"
+          className="mt-5 w-full inline-flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-black text-sm px-6 py-4 rounded-xl transition-all disabled:opacity-50">
+          {loading ? <><Loader2 size={16} className="animate-spin" /> Generating your routine…</>
+            : <><Sparkles size={16} /> Start &amp; Generate My Routine <ArrowRight size={15} /></>}
+        </button>
+        {error && <p className="text-xs text-rose-600 bg-rose-50 rounded-lg px-3 py-2 mt-3" data-testid="scan-error">{error}</p>}
       </div>
 
       {report && <ReportView report={report} />}
@@ -300,7 +392,64 @@ function ScanPanel({ token, onScanned, latest }) {
 }
 
 /* ----------------------------------------------------------------- PROGRESS */
-function ProgressPanel({ token }) {
+function PlanCard({ plan }) {
+  if (!plan) return null;
+  const day = plan.current_day || 1;
+  const total = plan.total_days || 30;
+  const pct = Math.min(100, Math.round((day / total) * 100));
+  const Steps = ({ title, icon: Icon, steps }) => (
+    <div className="bg-white rounded-2xl border border-stone-100 p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Icon size={16} className="text-emerald-600" />
+        <span className="text-sm font-black text-stone-900">{title}</span>
+      </div>
+      <ol className="space-y-2">
+        {(steps || []).map((s, i) => (
+          <li key={i} className="flex gap-3">
+            <span className="w-5 h-5 shrink-0 rounded-full bg-emerald-100 text-emerald-700 text-[11px] font-bold flex items-center justify-center mt-0.5">{i + 1}</span>
+            <div>
+              <p className="text-[13px] font-bold text-stone-800">{s.step}{s.product ? <span className="font-medium text-emerald-700"> · {s.product}</span> : null}</p>
+              {s.how && <p className="text-[12px] text-stone-500">{s.how}</p>}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+  return (
+    <div className="space-y-4" data-testid="plan-card">
+      <div className="bg-gradient-to-br from-amber-50 to-white rounded-2xl border border-amber-100 p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <p className="text-[11px] font-black uppercase tracking-wider text-amber-700">Your 30-Day Routine Plan</p>
+            <p className="text-lg font-black text-stone-900">Day {day} of {total}</p>
+          </div>
+          <span className="inline-flex items-center gap-1 bg-emerald-100 text-emerald-800 rounded-full px-3 py-1.5 text-[11px] font-black" data-testid="plan-status">
+            <Check size={12} /> Routine active &amp; saved
+          </span>
+        </div>
+        <div className="mt-3 h-2 rounded-full bg-amber-100 overflow-hidden">
+          <div className="h-full rounded-full bg-gradient-to-r from-amber-400 to-emerald-500 transition-all" style={{ width: `${pct}%` }} />
+        </div>
+        {plan.goals?.length ? (
+          <div className="flex flex-wrap gap-1.5 mt-3">
+            {plan.goals.map((g) => (
+              <span key={g} className="text-[11px] font-bold bg-white border border-amber-200 text-amber-800 rounded-full px-2.5 py-1">{g}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      {(plan.am_routine?.length || plan.pm_routine?.length) ? (
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Steps title="Morning Routine" icon={Sun} steps={plan.am_routine} />
+          <Steps title="Night Routine" icon={Moon} steps={plan.pm_routine} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProgressPanel({ token, plan }) {
   const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
@@ -314,14 +463,18 @@ function ProgressPanel({ token }) {
 
   if (loading) return <div className="py-16 text-center text-stone-400"><Loader2 className="animate-spin mx-auto" /></div>;
   if (!scans.length) return (
-    <div className="bg-white rounded-2xl border border-stone-100 p-10 text-center">
-      <TrendingUp size={28} className="text-stone-300 mx-auto mb-2" />
-      <p className="text-sm text-stone-500">No scans yet. Run your first skin scan to start tracking progress.</p>
+    <div className="space-y-4">
+      <PlanCard plan={plan} />
+      <div className="bg-white rounded-2xl border border-stone-100 p-10 text-center">
+        <TrendingUp size={28} className="text-stone-300 mx-auto mb-2" />
+        <p className="text-sm text-stone-500">No scans yet. Run your first skin scan to start tracking progress.</p>
+      </div>
     </div>
   );
   const max = Math.max(...scans.map((s) => s.skin_score || 0), 100);
   return (
     <div className="space-y-4">
+      <PlanCard plan={plan} />
       <div className="bg-white rounded-2xl border border-stone-100 p-4">
         <p className="text-sm font-black text-stone-900 mb-3">Skin Score over time</p>
         <div className="flex items-end gap-2 h-32">
@@ -412,6 +565,7 @@ const TABS = [
 function Dashboard({ token, user, onLogout }) {
   const [tab, setTab] = useState('scan');
   const [latest, setLatest] = useState(null);
+  const [plan, setPlan] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -419,8 +573,20 @@ function Dashboard({ token, user, onLogout }) {
         const r = await axios.get(`${API}/api/tracker/scans`, authHeader(token));
         setLatest(r.data.latest || null);
       } catch {}
+      // Resume the saved 30-day plan so it persists across logins/reloads.
+      try {
+        const p = await axios.get(`${API}/api/tracker/plan`, authHeader(token));
+        if (p.data?.plan) setPlan(p.data.plan);
+      } catch {}
     })();
   }, [token]);
+
+  // Routine generated → the plan is running; hand the user to the progress page.
+  const handlePlanStarted = useCallback((started) => {
+    if (started) setPlan(started);
+    setTab('progress');
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch {}
+  }, []);
 
   return (
     <div className="max-w-5xl mx-auto px-3 sm:px-6 py-6">
@@ -451,8 +617,8 @@ function Dashboard({ token, user, onLogout }) {
         ))}
       </div>
 
-      {tab === 'scan' && <ScanPanel token={token} latest={latest} onScanned={setLatest} />}
-      {tab === 'progress' && <ProgressPanel token={token} />}
+      {tab === 'scan' && <ScanPanel token={token} latest={latest} onScanned={setLatest} onPlanStarted={handlePlanStarted} />}
+      {tab === 'progress' && <ProgressPanel token={token} plan={plan} />}
       {tab === 'orders' && <OrdersPanel token={token} />}
       {tab === 'profile' && (
         <div className="bg-white rounded-2xl border border-stone-100 p-5 space-y-3 max-w-md">
@@ -471,12 +637,6 @@ function Dashboard({ token, user, onLogout }) {
 export default function TrackerPage() {
   const [token, setToken] = useState(() => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } });
   const [user, setUser] = useState(() => { try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; } });
-  const [journeyId, setJourneyId] = useState(() => { try { return localStorage.getItem('cg_journey_id'); } catch { return null; } });
-
-  const clearJourney = useCallback(() => {
-    try { localStorage.removeItem('cg_journey_id'); } catch {}
-    setJourneyId(null);
-  }, []);
 
   const logout = useCallback(() => {
     try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY); } catch {}
@@ -497,6 +657,21 @@ export default function TrackerPage() {
     </div>
   );
 
-  if (!token) return <div className="min-h-screen bg-stone-50 pb-16"><TopBack /><div className="max-w-md mx-auto px-4 mt-6"><JourneyStart /></div><LoginGate onLogin={(t, u) => { setToken(t); setUser(u); }} /></div>;
-  return <div className="min-h-screen bg-stone-50 pb-16"><TopBack /><div className="max-w-5xl mx-auto px-4 mt-6"><JourneyStart /></div><Dashboard token={token} user={user} onLogout={logout} /></div>;
+  // The 30-day plan onboarding (photo + goals + gender + age) deliberately
+  // does NOT live here any more. Before login we only show the login gate;
+  // all details are collected on the scanning page inside the dashboard.
+  if (!token) {
+    return (
+      <div className="min-h-screen bg-stone-50 pb-16">
+        <TopBack />
+        <LoginGate onLogin={(t, u) => { setToken(t); setUser(u); }} />
+      </div>
+    );
+  }
+  return (
+    <div className="min-h-screen bg-stone-50 pb-16">
+      <TopBack />
+      <Dashboard token={token} user={user} onLogout={logout} />
+    </div>
+  );
 }

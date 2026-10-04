@@ -920,137 +920,53 @@ def _slugify(text: str) -> str:
 async def _ai_generate_product_image(name: str, brand: str, category: str,
                                      ref_images: Optional[list] = None,
                                      extra_prompt: str = "") -> Optional[str]:
-    """Generate a photorealistic product image with GEMINI and persist it.
-    Provider chain:
-      1. Gemini "Nano Banana" image model via Emergent LLM key (uses the brand's
-         THEME reference images so output matches the sample look exactly).
-      2. Direct Google Gemini (GEMINI_API_KEY) — free tier may 403.
-      3. Pollinations (free, text-only) as a last-resort fallback.
-    Saved to Cloudinary if configured, else to local /api/uploads/products/.
-    Returns a public URL or None.
+    """Render the product's hero image from an APPROVED brand bottle.
+
+    STRICT BRAND RULE (owner mandate, Feb 2026)
+    ===========================================
+    Generated product imagery may show ONLY the two owner-supplied bottles:
+
+      * the "ADVANCED FACE SERUM" pump bottle   → serums, toners, essences…
+      * the "ADVANCED RETINOID NIGHT CREAM" pump → creams, moisturisers, SPF…
+
+    The previous implementation asked Gemini / Pollinations to *invent* a bottle
+    from a text prompt. That is explicitly not accepted: every run produced a
+    different, non-brand bottle. Text-to-image invention is therefore removed
+    altogether — the only reliable way to guarantee the rule is to composite the
+    real approved photograph rather than hope a model reproduces it.
+
+    The output is a crisp 1400px hero on a pure-white backdrop (quality 97,
+    4:4:4 chroma) and is stored on Cloudinary under a deterministic public_id,
+    so it is sharp AND permanent.
     """
-    import base64 as _b64
-    # Auto-load the brand THEME reference images (the samples the admin provided)
-    # so every generated product matches the exact studio style.
-    if ref_images is None:
-        ref_images = []
-        try:
-            _theme_dir = _Path(__file__).parent.parent / "uploads" / "theme_refs"
-            for _f in sorted(_theme_dir.glob("*.png")) + sorted(_theme_dir.glob("*.jpg")):
-                try:
-                    ref_images.append(_f.read_bytes())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    ings = (extra_prompt or "").strip()
-    prompt = (
-        "Professional product photography on a PURE WHITE background (#FFFFFF). The background must be completely "
-        "white with no shadows, no gradients, no textures, no grey tones, no off-white. Solid pure white background "
-        "only. Studio lighting. Clean white seamless backdrop. "
-        f"Ultra-clean e-commerce product photograph of a single {brand} skincare {category or 'product'}: '{name}'. "
-        "STYLE (match exactly): one pristine WHITE pump bottle standing upright, perfectly centred, with a large "
-        "translucent glossy SERUM GEL DROPLET / swirl and a few smaller clear serum droplets arranged BEHIND and "
-        "beside the bottle (visible around the edges of the bottle) on a seamless PURE-WHITE (#FFFFFF) studio "
-        "background, soft even diffused lighting, NO grounding shadow, minimalist high-end clinical beauty aesthetic, "
-        "1:1 square. The serum drops must look like real transparent skincare gel, subtly tinted, never opaque. "
-        "The bottle label is printed in an elegant minimalist layout using GREEN and grey text: the vertical brand "
-        f"wordmark 'CELESTA GLOW', then the product name '{name}', a formula line, "
-        + (f"the key ingredients ({ings}), " if ings else "the key ingredients, ")
-        + "a few short benefit bullets, 'FOR ALL SKIN TYPES' and the pack size. "
-        "Photorealistic, sharp focus, no hands, no extra props, no busy background."
-    )
-    if ref_images:
-        prompt = ("Recreate the EXACT visual style, white background, lighting, green+grey typography and "
-                  "composition of the provided reference product images, but for THIS product. " + prompt)
-
-    out_bytes = None
-    mime = "image/png"
-
-    # 1) Gemini Nano Banana via Emergent LLM key (image-out modality)
-    emergent_key = os.environ.get("EMERGENT_LLM_KEY")
-    if emergent_key:
-        try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
-            file_contents = []
-            for rb in (ref_images or []):
-                try:
-                    file_contents.append(ImageContent(_b64.b64encode(rb).decode("utf-8")))
-                except Exception:
-                    pass
-            chat = LlmChat(
-                api_key=emergent_key, session_id=f"prodimg-{uuid.uuid4().hex[:8]}",
-                system_message="You are a skincare-brand visual designer that produces photorealistic, premium product images on a clean white background.",
-            )
-            chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
-            msg = UserMessage(text=prompt, file_contents=file_contents or None)
-            _text, images = await chat.send_message_multimodal_response(msg)
-            if images:
-                out_bytes = _b64.b64decode(images[0]["data"])
-                mime = images[0].get("mime_type", "image/png")
-        except Exception as e:
-            logger.warning(f"[img-gen] Gemini(Emergent) image failed: {e}")
-
-    # 2) Direct Google Gemini (GEMINI_API_KEY)
-    if not out_bytes:
-        gkey = os.environ.get("GEMINI_API_KEY")
-        if gkey:
-            try:
-                from google import genai
-                from google.genai import types as _gt
-                client = genai.Client(api_key=gkey)
-                parts = [prompt]
-                for rb in (ref_images or []):
-                    parts.append(_gt.Part.from_bytes(data=rb, mime_type="image/png"))
-                resp = client.models.generate_content(model="gemini-2.5-flash-image", contents=parts)
-                for part in (resp.candidates[0].content.parts if resp.candidates else []):
-                    inline = getattr(part, "inline_data", None)
-                    if inline and getattr(inline, "data", None):
-                        out_bytes = inline.data
-                        mime = inline.mime_type or "image/png"
-                        break
-            except Exception as e:
-                logger.warning(f"[img-gen] Gemini(direct) image failed: {e}")
-
-    # 3) Pollinations (free, text-only) as final fallback
-    if not out_bytes:
-        try:
-            import httpx as _httpx
-            from urllib.parse import quote as _q
-            url = (
-                f"https://image.pollinations.ai/prompt/{_q(prompt)}"
-                f"?width=1024&height=1024&model=flux&nologo=true&enhance=true&seed={uuid.uuid4().int % 10_000_000}"
-            )
-            async with _httpx.AsyncClient(timeout=90.0, follow_redirects=True) as hc:
-                r = await hc.get(url)
-                if r.status_code == 200 and r.content and len(r.content) > 1024:
-                    out_bytes = r.content
-                    mime = r.headers.get("content-type", "image/jpeg").split(";")[0]
-        except Exception as e:
-            logger.warning(f"[img-gen] Pollinations image failed: {e}")
-
-    if not out_bytes:
+    try:
+        from services import brand_bottles, durable_images
+    except Exception as e:
+        logger.error(f"[img-gen] approved-bottle renderer unavailable: {e}")
         return None
 
-    # Persist — Cloudinary first, else local
+    product_hint = {
+        "name": name,
+        "short_name": name,
+        "category": category or "",
+        "slug": _slugify(name),
+        "key_ingredients": extra_prompt or "",
+    }
     try:
-        from services import cloudinary_service as _cs
-        if await _cs.ensure_configured(_db):
-            res = await _cs.upload_image(
-                _db, out_bytes, folder="celesta-glow/products",
-                public_id=f"prod-{uuid.uuid4().hex[:12]}",
-            )
-            if res.get("url"):
-                return res["url"]
+        out_bytes = brand_bottles.hero_bytes(product_hint)
     except Exception as e:
-        logger.warning(f"[img-gen] Cloudinary upload failed, falling back to local: {e}")
+        logger.error(f"[img-gen] approved-bottle render failed for '{name}': {e}")
+        return None
 
-    ext = "png" if "png" in mime else "jpg"
-    filename = f"prod-{uuid.uuid4().hex[:12]}.{ext}"
-    with open(_PROD_IMG_DIR / filename, "wb") as f:
-        f.write(out_bytes)
-    return f"/api/uploads/products/{filename}"
+    try:
+        return await durable_images.save_image(
+            _db, out_bytes,
+            slug=_slugify(name), tag="hero",
+            folder="celesta-glow/generated",
+        )
+    except Exception as e:
+        logger.error(f"[img-gen] durable save failed for '{name}': {e}")
+        return None
 
 
 @router.post("/admin/ai/one-click-product")
@@ -1282,8 +1198,9 @@ Tone: trustworthy, clinical-but-warm, India-aware. Avoid "miracle"/"instant cure
     # a lab certificate and a BEFORE/AFTER pair — drawn with Pillow so it works
     # even when no product photo was provided (a clean placeholder bottle is used).
     try:
-        from services.gallery_composer import generate_gallery_and_certificate
-        media = generate_gallery_and_certificate(
+        from services.gallery_composer import generate_and_persist
+        media = await generate_and_persist(
+            _db,
             {**product, "solves": ", ".join(concern_list) or "your skin concern"},
             do_gallery=True, do_certificate=True, do_before_after=True,
         )
@@ -1407,6 +1324,8 @@ async def _image_via_providers(prompt: str, ref_images: list) -> tuple:
 
 
 async def _persist_img(out_bytes: bytes, mime: str) -> Optional[str]:
+    """Store marketing imagery on Cloudinary. Local disk is NOT an acceptable
+    destination — it is wiped on redeploy, which is how images went missing."""
     try:
         from services import cloudinary_service as _cs
         if await _cs.ensure_configured(_db):
@@ -1414,13 +1333,17 @@ async def _persist_img(out_bytes: bytes, mime: str) -> Optional[str]:
                                          public_id=f"mkt-{uuid.uuid4().hex[:12]}")
             if res.get("url"):
                 return res["url"]
-    except Exception:
-        pass
-    ext = "png" if "png" in mime else "jpg"
-    fn = f"mkt-{uuid.uuid4().hex[:12]}.{ext}"
-    with open(_PROD_IMG_DIR / fn, "wb") as f:
-        f.write(out_bytes)
-    return f"/api/uploads/products/{fn}"
+    except Exception as e:
+        logger.error(f"[mkt-img] Cloudinary upload failed: {e}")
+
+    if (os.environ.get("ALLOW_LOCAL_UPLOADS") or "").lower() in ("1", "true", "yes"):
+        ext = "png" if "png" in mime else "jpg"
+        fn = f"mkt-{uuid.uuid4().hex[:12]}.{ext}"
+        with open(_PROD_IMG_DIR / fn, "wb") as f:
+            f.write(out_bytes)
+        logger.warning("[mkt-img] stored on EPHEMERAL local disk (ALLOW_LOCAL_UPLOADS)")
+        return f"/api/uploads/products/{fn}"
+    return None
 
 
 class MarketingImageRequest(BaseModel):

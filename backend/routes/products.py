@@ -1071,9 +1071,9 @@ async def generate_product_images(
     do_cert = payload.get("certificate", True)
     do_ba = payload.get("before_after", True)
     try:
-        from services.gallery_composer import generate_gallery_and_certificate
-        fields = generate_gallery_and_certificate(
-            product, do_gallery=do_gallery, do_certificate=do_cert, do_before_after=do_ba
+        from services.gallery_composer import generate_and_persist
+        fields = await generate_and_persist(
+            db, product, do_gallery=do_gallery, do_certificate=do_cert, do_before_after=do_ba
         )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))

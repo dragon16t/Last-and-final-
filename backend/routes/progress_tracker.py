@@ -27,6 +27,7 @@ import base64
 import logging
 import hashlib
 import secrets
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +535,11 @@ class ScanRequest(BaseModel):
     age: Optional[str] = None
     concerns: List[str] = []
     notes: Optional[str] = None
+    # Collected on the tracker's own scanning page (post-OTP-login) so the
+    # 30-day plan can be built and started in the same submit.
+    goals: List[str] = []
+    gender: Optional[str] = None
+    start_plan: bool = True                # begin the saved 30-day routine plan
 
 
 @router.post("/tracker/scan")
@@ -666,7 +672,91 @@ async def tracker_scan(req: ScanRequest, authorization: Optional[str] = Header(N
     except Exception as e:
         logger.warning(f"[tracker] scan log save failed: {e}")
 
-    return {"success": True, "report": report}
+    # ---- Start (or resume) the saved 30-day routine plan --------------------
+    # The plan used to be kicked off from the Routine page before login, which
+    # forced an anonymous selfie upload. It now begins HERE, right after the
+    # logged-in user submits their scanning details, and is persisted against
+    # their email so it survives logout and is resumed on the progress page.
+    plan = None
+    if req.start_plan:
+        try:
+            plan = await _ensure_routine_plan(
+                email=email,
+                goals=req.goals,
+                gender=req.gender,
+                age=report.get("age"),
+                photo_url=photo_url,
+                analysis=analysis,
+                skin_score=overall,
+                routine=routine,
+                now=now,
+            )
+        except Exception as e:
+            logger.error(f"[tracker] 30-day plan start failed: {e}", exc_info=True)
+
+    return {"success": True, "report": report, "plan": plan}
+
+
+async def _ensure_routine_plan(*, email, goals, gender, age, photo_url, analysis,
+                               skin_score, routine, now):
+    """Create the user's 30-day routine plan, or return the active one.
+
+    Idempotent: one active plan per account, so a repeat scan updates the
+    latest reading instead of silently starting a second 30-day cycle.
+    """
+    existing = await db.routine_plans.find_one(
+        {"email": email, "status": "active"}, {"_id": 0}
+    )
+    if existing:
+        await db.routine_plans.update_one(
+            {"plan_id": existing["plan_id"]},
+            {"$set": {
+                "latest_scan_score": skin_score,
+                "latest_scan_at": _iso(now),
+                "goals": goals or existing.get("goals", []),
+                "updated_at": _iso(now),
+            }},
+        )
+        existing.update({"latest_scan_score": skin_score, "latest_scan_at": _iso(now)})
+        return existing
+
+    plan_id = uuid.uuid4().hex[:12]
+    plan = {
+        "plan_id": plan_id,
+        "email": email,
+        "status": "active",
+        "goals": goals or [],
+        "gender": gender or "",
+        "age": age or "",
+        "before_photo": photo_url,
+        "baseline_score": skin_score,
+        "latest_scan_score": skin_score,
+        "latest_scan_at": _iso(now),
+        "current_day": 1,
+        "total_days": FREE_DAYS,
+        "am_routine": routine.get("am_routine", []),
+        "pm_routine": routine.get("pm_routine", []),
+        "diet": routine.get("diet", []),
+        "control": routine.get("control", []),
+        "weekly": routine.get("weekly", []),
+        "primary_concern": (analysis or {}).get("primary_concern"),
+        "started_at": _iso(now),
+        "created_at": _iso(now),
+        "updated_at": _iso(now),
+    }
+    await db.routine_plans.insert_one(dict(plan))
+    plan.pop("_id", None)
+    return plan
+
+
+@router.get("/tracker/plan")
+async def tracker_plan(authorization: Optional[str] = Header(None)):
+    """The logged-in user's active 30-day routine plan (resumed on load)."""
+    session = await _user(authorization)
+    plan = await db.routine_plans.find_one(
+        {"email": session["email"], "status": "active"}, {"_id": 0}
+    )
+    return {"plan": plan}
 
 
 @router.get("/tracker/scans")

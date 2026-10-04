@@ -11,13 +11,31 @@ import os
 import re
 import io
 import hashlib
+import logging
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageChops
 
+logger = logging.getLogger(__name__)
+
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PRODUCTS_DIR = os.path.join(BACKEND, "uploads", "products")
 os.makedirs(PRODUCTS_DIR, exist_ok=True)
+
+
+def _persist(img, slug: str, tag: str, cache_filename: str = None) -> str:
+    """Store a composed card on Cloudinary and return its PERMANENT URL.
+
+    Generated artwork must never be served from `/api/uploads/...` — that disk
+    is wiped on every redeploy, which is exactly why images "vanished after a
+    few days". `durable_images` uploads under a deterministic public_id, so
+    re-generating refreshes the same asset in place.
+    """
+    from services import durable_images
+    return durable_images.save_image_sync(
+        None, img, slug=slug, tag=tag, quality=95,
+        cache_filename=cache_filename,
+    )
 
 F_DIR = "/usr/share/fonts/truetype/liberation"
 F_BOLD = os.path.join(F_DIR, "LiberationSans-Bold.ttf")
@@ -127,12 +145,55 @@ def _crop_bottle(im: Image.Image) -> Image.Image:
                     min(im.width, r + pad), min(im.height, b + pad)))
 
 
-def _paste(canvas, bottle, target_h, cx, bottom):
+def _paste(canvas, bottle, target_h, cx, bottom, keep_clear_x=None):
+    """Composite the bottle onto the card THROUGH ITS ALPHA CHANNEL.
+
+    This is the fix for the "white block covering the ingredient text" bug.
+    The bottle used to be a rectangular RGB crop whose white studio backdrop
+    was pasted opaquely over whatever copy sat beneath it. The bottle is now
+    RGBA (background cut away in `brand_bottles`), so only the product's own
+    pixels land on the card and every word stays readable.
+
+    `keep_clear_x` is a hard left boundary: if the scaled bottle would reach
+    into the text column, it is nudged right (and shrunk as a last resort) so
+    product and copy can never collide.
+    """
+    bottle = bottle.convert("RGBA")
     scale = target_h / bottle.height
-    nw = int(bottle.width * scale)
+    nw = max(1, int(bottle.width * scale))
+    left = int(cx - nw / 2)
+
+    if keep_clear_x is not None and left < keep_clear_x:
+        # 1) try sliding right while staying on-canvas
+        max_left = W - nw - 12
+        if max_left >= keep_clear_x:
+            left = keep_clear_x
+        else:
+            # 2) not enough room — scale the bottle down to fit the clear zone
+            avail = max(80, W - 12 - keep_clear_x)
+            scale = min(scale, avail / bottle.width)
+            target_h = max(1, int(bottle.height * scale))
+            nw = max(1, int(bottle.width * scale))
+            left = keep_clear_x
+
     b = bottle.resize((nw, target_h), Image.LANCZOS)
-    canvas.paste(b, (int(cx - nw / 2), int(bottom - target_h)))
-    return int(cx - nw / 2), int(bottom - target_h), nw
+    top = int(bottom - target_h)
+
+    # Soft contact shadow so a cut-out bottle still sits naturally on white.
+    try:
+        from PIL import ImageFilter as _IF
+        sh_h = max(10, int(target_h * 0.035))
+        shadow = Image.new("RGBA", (nw, sh_h * 3), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).ellipse(
+            [int(nw * 0.10), sh_h, int(nw * 0.90), sh_h * 2], fill=(120, 128, 120, 70)
+        )
+        shadow = shadow.filter(_IF.GaussianBlur(sh_h * 0.5))
+        canvas.paste(shadow, (left, int(bottom - sh_h * 1.4)), shadow)
+    except Exception:
+        pass
+
+    canvas.paste(b, (left, top), b)
+    return left, top, nw
 
 
 def _canvas():
@@ -161,7 +222,7 @@ def _layout_a(bottle, word, story, desc, solves, best_for):
     y += 8
     for ln in _wrap(d, desc, f_sm, 560):
         d.text((70, y), ln, font=f_sm, fill=INK); y += 38
-    left, top, _ = _paste(im, bottle, 760, 935, 1160)
+    left, top, _ = _paste(im, bottle, 760, 935, 1160, keep_clear_x=660)
     _connector(d, 70 + hw + 12, 316 + f_h.size + 30, left + 60, top + 260)
     return im
 
@@ -189,7 +250,7 @@ def _layout_b(bottle, word, story, desc, solves, best_for, name):
     yy = ct + 76
     for ln in _wrap(d, best_for + ".", f_cb, 290):
         d.text((870, yy), ln, font=f_cb, fill=INK); yy += 36
-    _paste(im, bottle, 660, 600, 1150)
+    _paste(im, bottle, 660, 600, 1150, keep_clear_x=415)
     return im
 
 
@@ -219,7 +280,7 @@ def _layout_c(bottle, word, story, desc, solves, best_for):
     d.text((70, 640), word, font=lab, fill=GREEN)
     d.line([(70, 640 + lab.size + 8), (70 + lw, 640 + lab.size + 8)], fill=GREEN, width=4)
     _connector(d, 70 + lw, 640 + lab.size // 2, cx + 40, cy - 40)
-    _paste(im, bottle, 800, 950, 1165)
+    _paste(im, bottle, 800, 950, 1165, keep_clear_x=790)
     return im
 
 
@@ -241,7 +302,7 @@ def _layout_d(bottle, word, story, desc, solves, best_for):
     yy = 1050
     for ln in _wrap(d, f"Best for: {best_for}.", f_sm, 600):
         d.text((70, yy), ln, font=f_sm, fill=GREY); yy += 34
-    left, top, _ = _paste(im, bottle, 740, 940, 1155)
+    left, top, _ = _paste(im, bottle, 740, 940, 1155, keep_clear_x=710)
     _connector(d, 70 + hw + 10, 270 + f_h.size + 30, left + 50, top + 240)
     return im
 
@@ -330,7 +391,7 @@ def _layout_solution(bottle, concern_label, problem, change, audience):
     pw = _tw(d, pill, f_aud)
     d.rounded_rectangle([70, ay, 70 + pw + 44, ay + 52], radius=26, fill=(233, 246, 238))
     d.text((92, ay + 12), pill, font=f_aud, fill=GREEN)
-    _paste(im, bottle, 620, 950, 1150)
+    _paste(im, bottle, 620, 950, 1150, keep_clear_x=730)
     return im
 
 
@@ -405,17 +466,24 @@ def _placeholder_bottle() -> Image.Image:
 
 
 def _resolve_bottle(product: dict):
-    """Return the product's cropped bottle from its hero photo, or a drawn
-    placeholder bottle when no usable photo exists. Never raises."""
-    images = list(product.get("images") or [])
-    for u in images:
-        if not u:
-            continue
-        try:
-            return _crop_bottle(_whiten_bg(_load_local_or_remote(u)))
-        except Exception:
-            continue
-    return _placeholder_bottle()
+    """Return the APPROVED brand bottle for this product, background removed.
+
+    STRICT BRAND RULE: only the two owner-supplied bottles (the Advanced Face
+    Serum pump and the Advanced Retinoid Night Cream pump) may appear in
+    generated artwork. Whatever image a product row happens to carry is
+    deliberately ignored — scraped studio shots, AI-invented bottles and the
+    old drawn placeholder are all rejected. The product's own name and actives
+    are re-printed onto the approved bottle so each card still reads correctly.
+
+    Returns RGBA so `_paste` can composite it without covering any text.
+    """
+    from services import brand_bottles
+    try:
+        return brand_bottles.resolve(product or {})
+    except Exception as exc:
+        # Last resort: the un-relabelled master, still an approved bottle.
+        logging.error(f"[gallery] approved-bottle relabel failed: {exc}")
+        return brand_bottles.resolve(product or {}, relabelled=False)
 
 
 def _skin_panel(kind: str, concern_label: str, audience: str) -> Image.Image:
@@ -477,17 +545,14 @@ def _skin_panel(kind: str, concern_label: str, audience: str) -> Image.Image:
 
 
 def before_after_pair(slug: str, concern_label: str, audience: str = "") -> dict:
-    """Compose a BEFORE + AFTER macro-skin pair (brand theme) and save both.
-    Returns {before_image, after_image}. Budget-free — drawn with Pillow."""
+    """Compose a BEFORE + AFTER macro-skin pair (brand theme) and save both to
+    Cloudinary. Returns {before_image, after_image} as PERMANENT URLs."""
     concern_label = concern_label or "Visible skin concerns"
     before = _skin_panel("before", concern_label, audience)
     after = _skin_panel("after", concern_label, audience)
-    bfn = f"{slug}-before.jpg"; afn = f"{slug}-after.jpg"
-    before.save(os.path.join(PRODUCTS_DIR, bfn), "JPEG", quality=90)
-    after.save(os.path.join(PRODUCTS_DIR, afn), "JPEG", quality=90)
     return {
-        "before_image": f"/api/uploads/products/{bfn}",
-        "after_image": f"/api/uploads/products/{afn}",
+        "before_image": _persist(before, slug, "before", f"{slug}-before.jpg"),
+        "after_image": _persist(after, slug, "after", f"{slug}-after.jpg"),
     }
 
 
@@ -495,17 +560,17 @@ def generate_gallery_and_certificate(product: dict, do_gallery=True, do_certific
                                      do_before_after=True) -> dict:
     """Compose gallery cards + certificate (+ before/after) for a product dict.
 
-    Returns fields to $set. A hero product photo is OPTIONAL — when the product
-    has no usable image, a clean Celesta Glow placeholder bottle is drawn so the
-    whole Formula-Technology gallery + certificate + before/after still render.
+    Returns fields to $set. Every image is stored on Cloudinary under a
+    deterministic public_id, so the returned URLs are permanent and survive
+    redeploys.
+
+    Image 1 is ALWAYS a freshly rendered high-quality hero shot of the approved
+    brand bottle (quality 97, 4:4:4 chroma, 1400px) — this replaces the soft,
+    over-compressed hero the storefront used to show. Images 2-5 are the
+    Formula-Technology cards, onto which the bottle is composited through its
+    alpha channel so it can never cover the ingredient copy.
     """
     slug = product["slug"]
-    images = list(product.get("images") or [])
-    has_photo = False
-    for u in images:
-        if u:
-            has_photo = True
-            break
 
     bottle = _resolve_bottle(product)
     name = (product.get("short_name") or product.get("name") or "PRODUCT").upper()
@@ -514,7 +579,16 @@ def generate_gallery_and_certificate(product: dict, do_gallery=True, do_certific
     stories = _stories_from_product(product)
 
     result = {}
-    hero = images[0].split("?")[0] if has_photo else None
+
+    # ---- Image 1: crisp hero shot of the approved bottle -------------------
+    hero = None
+    try:
+        from services import brand_bottles
+        hero = _persist(
+            brand_bottles.hero_bytes(product), slug, "hero", f"{slug}-hero.jpg",
+        )
+    except Exception as exc:
+        logger.error(f"[gallery] hero render failed for {slug}: {exc}")
 
     if do_gallery:
         layouts = [
@@ -525,22 +599,18 @@ def generate_gallery_and_certificate(product: dict, do_gallery=True, do_certific
         ]
         tech_urls = []
         for i, img in enumerate(layouts, start=1):
-            fn = f"{slug}-tech{i}.jpg"
-            img.save(os.path.join(PRODUCTS_DIR, fn), "JPEG", quality=92)
-            tech_urls.append(f"/api/uploads/products/{fn}")
-        # When there's no hero photo, the first Formula-Technology card doubles as
-        # the hero so `images[0]` is always a valid product visual.
+            tech_urls.append(_persist(img, slug, f"tech{i}", f"{slug}-tech{i}.jpg"))
         new_imgs = ([hero] if hero else []) + tech_urls
         result["images"] = new_imgs
         result["tech_stories"] = [
             {"ingredient": w, "headline": s, "description": d} for (w, s, d) in stories
         ]
+    elif hero:
+        result["images"] = [hero] + [u for u in (product.get("images") or []) if u][1:]
 
     if do_certificate:
         cert = _certificate(product.get("name", "Product"))
-        cfn = f"{slug}-certificate.jpg"
-        cert.save(os.path.join(PRODUCTS_DIR, cfn), "JPEG", quality=92)
-        result["test_report_image"] = f"/api/uploads/products/{cfn}"
+        result["test_report_image"] = _persist(cert, slug, "certificate", f"{slug}-certificate.jpg")
         result["test_report_lab"] = "Mascot Spincontrol — Clinical Research"
 
     if do_before_after:
@@ -554,3 +624,28 @@ def generate_gallery_and_certificate(product: dict, do_gallery=True, do_certific
         result["before_after_after"] = ba["after_image"]
 
     return result
+
+
+async def generate_and_persist(db, product: dict, do_gallery=True,
+                               do_certificate=True, do_before_after=True) -> dict:
+    """Async entry point for FastAPI routes.
+
+    Pillow composition plus the Cloudinary uploads are CPU/IO bound and fully
+    synchronous, so they run in a worker thread — a route awaiting this never
+    blocks the event loop. Cloudinary credentials are verified up front so the
+    caller gets a clear 503-style error instead of a half-generated gallery
+    whose URLs would die on the next redeploy.
+    """
+    import asyncio
+    from services import cloudinary_service as cs
+
+    if not await cs.ensure_configured(db):
+        raise RuntimeError(
+            "Cloudinary is not configured — image generation is disabled because "
+            "the generated artwork could not be stored permanently. Set "
+            "CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET."
+        )
+    return await asyncio.to_thread(
+        generate_gallery_and_certificate, product,
+        do_gallery, do_certificate, do_before_after,
+    )

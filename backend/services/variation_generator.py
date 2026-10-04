@@ -14,6 +14,7 @@ Every variation:
   * is correctly linked to the concern + inherits the source product type
     (niche / category / subcategory) so catalog taxonomy stays accurate.
 """
+import asyncio
 import os
 import re
 from datetime import datetime, timezone
@@ -42,11 +43,11 @@ def _slugify(s: str) -> str:
 def _compose_shared_gallery(product: dict, base_slug: str, concern_label: str):
     """Compose the 4 Formula-Technology cards ONCE and return
     (image_list, stories, bottle). All 24 variations reference these files.
-    A hero product photo is OPTIONAL — a clean placeholder bottle is drawn when
-    the source product has none."""
-    images = list(product.get("images") or [])
-    has_photo = any(bool(u) for u in images)
-    hero = images[0].split("?")[0] if has_photo else None
+
+    The bottle is always one of the two APPROVED brand bottles (resolved by
+    `gallery_composer._resolve_bottle`) with its background cut away, and every
+    card is stored on Cloudinary so the URLs never expire.
+    """
     bottle = gc._resolve_bottle(product)
     name = (product.get("short_name") or product.get("name") or "PRODUCT").upper()
     solves = concern_label
@@ -58,19 +59,23 @@ def _compose_shared_gallery(product: dict, base_slug: str, concern_label: str):
         gc._layout_c(bottle, *stories[2], solves, best_for),
         gc._layout_d(bottle, *stories[3], solves, best_for),
     ]
-    imgs = [hero] if hero else []
+    # Image 1 is a crisp, freshly rendered hero shot of the approved bottle.
+    imgs = []
+    try:
+        from services import brand_bottles
+        imgs.append(gc._persist(brand_bottles.hero_bytes(product), base_slug,
+                                "var-hero", f"{base_slug}-var-hero.jpg"))
+    except Exception:
+        pass
     for i, img in enumerate(layouts, start=1):
-        fn = f"{base_slug}-var-tech{i}.jpg"
-        img.save(os.path.join(PRODUCTS_DIR, fn), "JPEG", quality=92)
-        imgs.append(f"/api/uploads/products/{fn}")
+        imgs.append(gc._persist(img, base_slug, f"var-tech{i}",
+                                f"{base_slug}-var-tech{i}.jpg"))
     return imgs, stories, bottle
 
 
 def _certificate_for(name: str, slug: str) -> str:
     cert = gc._certificate(name)
-    cfn = f"{slug}-certificate.jpg"
-    cert.save(os.path.join(PRODUCTS_DIR, cfn), "JPEG", quality=92)
-    return f"/api/uploads/products/{cfn}"
+    return gc._persist(cert, slug, "certificate", f"{slug}-certificate.jpg")
 
 
 async def generate_variations(db, product: dict, concern_slug: str, concern_label: str) -> dict:
@@ -79,10 +84,23 @@ async def generate_variations(db, product: dict, concern_slug: str, concern_labe
     base_name = product.get("short_name") or product.get("name") or "Product"
     concern_label = concern_label or (concern_slug or "skin concerns").replace("-", " ").title()
 
-    shared_images, stories, bottle = _compose_shared_gallery(product, base_slug, concern_label)
+    # Cloudinary must be live before we render anything — otherwise the 100+
+    # generated assets would land on the pod's disposable disk and 404 later.
+    from services import cloudinary_service as _cs
+    if not await _cs.ensure_configured(db):
+        raise RuntimeError(
+            "Cloudinary is not configured — variation image generation aborted so "
+            "no artwork is stored on ephemeral disk."
+        )
+
+    shared_images, stories, bottle = await asyncio.to_thread(
+        _compose_shared_gallery, product, base_slug, concern_label
+    )
     # Shared BEFORE/AFTER pair (drawn once, referenced by every variation).
     try:
-        shared_ba = gc.before_after_pair(base_slug, concern_label, "every skin type & age")
+        shared_ba = await asyncio.to_thread(
+            gc.before_after_pair, base_slug, concern_label, "every skin type & age"
+        )
     except Exception:
         shared_ba = {}
     ba_list = []
@@ -142,8 +160,11 @@ async def generate_variations(db, product: dict, concern_slug: str, concern_labe
 
                 # Per-variation image work wrapped so ONE failure never aborts the
                 # whole batch — the variation still gets created with shared assets.
+                # Composition + Cloudinary upload are synchronous and CPU/IO bound,
+                # so they run in a worker thread to keep the event loop responsive
+                # across all 24 variations.
                 try:
-                    cert_url = _certificate_for(cert_name, vslug)
+                    cert_url = await asyncio.to_thread(_certificate_for, cert_name, vslug)
 
                     # Personalised problem -> solution card (pure-white, green theme)
                     problem = (
@@ -154,13 +175,15 @@ async def generate_variations(db, product: dict, concern_slug: str, concern_labe
                         f"{lead_active} plus a targeted actives blend visibly reduces "
                         f"{concern_label.lower()} — skin looks clearer, calmer and more even with daily use."
                     )
-                    sol_img = gc._layout_solution(
-                        bottle, concern_label, problem, change,
-                        f"{g_word} \u00b7 {skin} skin \u00b7 {age_label}",
-                    )
-                    sol_fn = f"{vslug}-solution.jpg"
-                    sol_img.save(os.path.join(PRODUCTS_DIR, sol_fn), "JPEG", quality=92)
-                    sol_url = f"/api/uploads/products/{sol_fn}"
+
+                    def _mk_solution():
+                        sol_img = gc._layout_solution(
+                            bottle, concern_label, problem, change,
+                            f"{g_word} \u00b7 {skin} skin \u00b7 {age_label}",
+                        )
+                        return gc._persist(sol_img, vslug, "solution", f"{vslug}-solution.jpg")
+
+                    sol_url = await asyncio.to_thread(_mk_solution)
                     sol_alt = f"How {base_name} solves {concern_label} for {g_word} with {skin.lower()} skin, {age_label}"
                 except Exception as _img_err:
                     import logging as _lg

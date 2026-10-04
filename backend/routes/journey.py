@@ -200,10 +200,27 @@ async def _pick_ad():
         return None
 
 
-def _save_photo(jid: str, name: str, image_b64: str) -> str:
+async def _save_photo(jid: str, name: str, image_b64: str) -> str:
+    """Persist a journey photo to Cloudinary and return its PERMANENT URL.
+
+    These used to be written to `backend/uploads/journeys/<jid>/` — the pod's
+    disposable disk — so a user's before/after proof silently 404'd after the
+    next redeploy. Cloudinary is now the source of truth; the local write is
+    kept only as a best-effort cache.
+    """
+    raw = base64.b64decode(_strip_data_url(image_b64))
+    try:
+        from services import durable_images
+        return await durable_images.save_image(
+            _db, raw, slug=f"journey-{jid}", tag=name,
+            folder="celesta-glow/journeys",
+        )
+    except Exception as exc:
+        logging.error(f"[journey] Cloudinary photo save failed ({jid}/{name}): {exc}")
+
+    # Last-resort local cache so the flow still completes in a dev pod.
     folder = os.path.join(UPLOAD_ROOT, jid)
     os.makedirs(folder, exist_ok=True)
-    raw = base64.b64decode(_strip_data_url(image_b64))
     path = os.path.join(folder, f"{name}.jpg")
     with open(path, "wb") as f:
         f.write(raw)
@@ -240,7 +257,7 @@ async def start_journey(payload: StartJourney):
 
     analysis = analyze_skin(photo)
     jid = uuid.uuid4().hex[:12]
-    before_url = _save_photo(jid, "before", photo)
+    before_url = await _save_photo(jid, "before", photo)
     day1 = generate_day_tasks(1, payload.goals, payload.gender, payload.age, analysis)
     ad = await _pick_ad()
 
@@ -293,7 +310,7 @@ async def submit_day(jid: str, day: int, payload: SubmitDay):
     if not is_human_face(proof):
         raise HTTPException(422, "It is not your face, honey 💛 — please upload your face with the proof photo to complete the day.")
 
-    proof_url = _save_photo(jid, f"day{day}", proof)
+    proof_url = await _save_photo(jid, f"day{day}", proof)
     # mark day done
     tasks = doc["days"][dkey]["tasks"]
     for t in tasks:
